@@ -1,0 +1,4 @@
+0.0.0.0 busou-patch.konamionline.com
+0.0.0.0 maintemgr.konamistyle.jp
+0.0.0.0 www.shinki-net.konami.jp
+0.0.0.0 bsogame001.konamionline.com
