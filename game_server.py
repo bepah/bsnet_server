@@ -1,4 +1,5 @@
 import hashlib
+import math
 import socket
 import struct
 import threading
@@ -15,68 +16,166 @@ def crypt_data(msg: bytes) -> bytes:
     return bytes(out)
 
 
-def make_response(command, req_id, extra_data: bytes) -> bytes:
-    out = struct.pack("<HBIB", command, 0, len(extra_data), req_id)
+class GameServer:
 
-    assert len(extra_data) <= 0x30
+    LARGE_MESSAGE_SIZE = 0x30 - (2 * 3)
 
-    if extra_data is not None:
-        out += hashlib.md5(out + extra_data).digest() + extra_data
-    else:
-        out += hashlib.md5(out).digest()
+    def __init__(self, conn: socket.socket, addr):
+        self.req_id = 0
 
-    return out
+        self.conn = conn
+        self.addr = addr
+        self.skip_send = False
 
+        self.dispatch_table = {
+            0x0101: self.cmd_login,
+            0x0102: self.cmd_register,
+            0x0104: self.cmd_front_connect,
+            0x0141: self.cmd_heartbeat,
 
-def handle_connection(conn, addr):
-    print("Connected from", addr)
+            # News can be skipped by returning other
+            0x4112: self.cmd_login_news,
+            0x4114: self.cmd_unk1
+        }
 
-    while True:
-        data = conn.recv(1024)
+    def make_response(self, command, extra_data: bytes, data_size: int = 0) -> bytes:
+        self.req_id += 1
+        out = struct.pack("<HBIB", command, data_size, len(extra_data), self.req_id)
+
+        assert len(extra_data) <= 0x30
+
+        if extra_data is not None:
+            out += hashlib.md5(out + extra_data).digest() + extra_data
+        else:
+            out += hashlib.md5(out).digest()
+
+        return out
+
+    @staticmethod
+    def verify_request(data: bytes) -> bool:
+        hashed = hashlib.md5(data[:0x8] + data[0x18:]).digest()
+        return hashed == data[0x8:0x18]
+
+    @staticmethod
+    def pad_bytes(data: bytes, size: int) -> bytes:
+        return data.ljust(size, b"\x00")
+
+    def send_large_message(self, cmd: int, message: bytes):
+        self.skip_send = True
+
+        total_message_size = math.ceil(len(message) / self.LARGE_MESSAGE_SIZE)
+        for part in range(total_message_size):
+            chunk = message[part * self.LARGE_MESSAGE_SIZE:(part + 1) * self.LARGE_MESSAGE_SIZE]
+
+            print(f"< [large] {part + 1}/{total_message_size} cmd=0x{cmd:04x}, chunk[0x{len(chunk):02x}]={chunk}")
+
+            self.conn.send(crypt_data(
+                self.make_response(
+                    cmd,
+                    struct.pack(">HHH", total_message_size, part + 1, len(chunk)) + chunk
+                )
+            ))
+
+    def parse_command(self) -> bool:
+        data = self.conn.recv(1024)
         data = crypt_data(data)
 
-        hashed = hashlib.md5(data[:0x8] + data[0x18:]).digest()
-
-        if hashed != data[0x8:0x18]:
+        if not self.verify_request(data):
             print(f"Invalid md5 hash for {data}")
-            conn.close()
-            return
+            self.conn.close()
+            return False
 
-        command, req_id = struct.unpack_from("<H5xB", data)
+        req_cmd, req_size = struct.unpack_from(">HB", data)
 
-        print(f"> [{req_id}] 0x{command:02x} | {data}")
+        print(f"> cmd=0x{req_cmd:04x}, data={data}")
 
-        if command == 0x4201 or command == 0x5b42:
-            conn.close()
-            print("Disconnected from", addr)
-            return
-        elif command == 0x0101:
-            # to_send = make_response(0x0001, struct.pack(">h", -301))  # New user
-            ip_addr = struct.unpack("@I", socket.inet_aton(addr[0]))[0]
-            to_send = make_response(0x0301, req_id, struct.pack(">IHIH", ip_addr, 5730, 0xdead, 0xbeef))
-        # elif command == 0x0201:
-            # Register user
-            # to_send = make_response(0x0301, struct.pack(">IHIH", 1, 1, 1, 1))
-        elif command == 0x401:
-            # -300, if we have more data to send
-            # to_send = make_response(0x0001, req_id, struct.pack(">h", -300))
-            to_send = make_response(0x0501, req_id, struct.pack(">HHI", 0, 0, 0))
-        elif command == 0x1241:
-            # News at login, gifts?
-            # to_send = make_response(0x0001, req_id, struct.pack(">h", -301))
-            to_send = make_response(0x1301, req_id, struct.pack(">HHH", 1, 1, 3) + b"\0" * 0x20)
-        elif command == 0x1441:
-            to_send = make_response(0x1301, req_id, struct.pack(">HHH", 3, 3, 3) + b"\0" * 0x20)
-        elif command == 0x4101:
-            # Heartbeat?
-            to_send = make_response(3, req_id, struct.pack(">HHH", 0, 0, 0) + b"\0" * 0x10)
-        else:
-            print("Unknown command, disconnecting...", hex(command))
-            conn.close()
-            return
+        if req_cmd == 0x0142 or req_cmd == 0x425b:
+            self.conn.close()
+            print("Disconnected from", self.addr)
+            return False
 
-        print(f"< [{req_id}]", to_send)
-        conn.send(crypt_data(to_send))
+        response_fnc = self.dispatch_table.get(req_cmd)
+
+        if not response_fnc:
+            print(f"Unknown command 0x{req_cmd:04x}, disconnecting...")
+            # Make dummy response to capture at breakpoint
+            self.conn.send(crypt_data(self.make_response(0xbeef, b"\0" * 0x30)))
+            self.conn.close()
+            return False
+
+        self.skip_send = False
+        data = response_fnc(data)
+
+        if self.skip_send is False:
+            print(f"< {data}")
+            self.conn.sendall(crypt_data(data))
+
+        return True
+
+    def cmd_login(self, data: bytes) -> bytes:
+        """
+        Called on checking if the user is valid to login
+        and a valid account exists, otherwise tell the game
+        to register for one.
+        """
+        # to_send = make_response(0x0001, struct.pack(">h", -301))  # New user
+        ip_addr = struct.unpack("@I", socket.inet_aton(self.addr[0]))[0]
+        return self.make_response(
+            0x0301,
+            struct.pack(">IHIH", ip_addr, 5730, 0xdead, 0xbeef)
+        )
+
+    def cmd_register(self, data: bytes) -> bytes:
+        """
+        Called when registering a user, provided birthday and
+        name. Returns back the same response as a login.
+        """
+        # TODO not implemented
+        return self.cmd_login(data)
+
+    def cmd_front_connect(self, data: bytes) -> bytes:
+        """
+        Called on connected to the front server from the gate server,
+        unknown parameters.
+        """
+        return self.make_response(0x0501, struct.pack(">HHI", 0, 0, 0))
+
+    def cmd_heartbeat(self, data: bytes) -> bytes:
+        """
+        Called once in a while to maintain connection to the server.
+        """
+        return self.make_response(3, struct.pack(">HHH", 0, 0, 0) + b"\0" * 0x10)
+
+    def cmd_login_news(self, data: bytes):
+        """
+        Retrieves news for a user when logged in
+        """
+        content = b"Hello world\n\nmessage 123"
+        msg = struct.pack("<HHII", 1, 1, 0, len(content))  # current, total, unknown, length
+        msg += self.pad_bytes(b"Name", 0x14)
+        msg += self.pad_bytes(b"Time", 0x80)
+        msg += content
+        self.send_large_message(0x1301, msg)
+
+    def cmd_unk1(self, data: bytes):
+        msg = struct.pack("<IIII", 4, 0, 4, 4)
+        msg += self.pad_bytes(b"hello", 0x90)
+        msg += self.pad_bytes(b"world", 0x90)
+        self.send_large_message(0x7e01, msg)
+
+
+def handle_connection(conn: socket.socket, addr):
+    print("Connected from", addr)
+
+    state = GameServer(conn, addr)
+
+    try:
+        while state.parse_command():
+            pass
+    except:
+        conn.close()
+
+        traceback.print_exc()
 
 
 def main():
