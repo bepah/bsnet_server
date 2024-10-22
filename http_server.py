@@ -112,14 +112,14 @@ def studio_api_sotai_list_route():
 
 @app.route("/buso/game_api/bs_ds_get_upartslist.html", methods=["POST"])
 def studio_api_uparts_list_route():
-    parts = [
-
-    ]
-
     out = "0\t\n"
 
-    for i in parts:
-        out += str(i) + "\t\n"
+    with open("docs/items.txt", "r", encoding="utf8") as f:
+        for line in f:
+            line = line.strip()
+
+            if line:
+                out += line.partition(",")[0] + "\t1\t\n"
 
     return out
 
